@@ -7,21 +7,20 @@
 #include <fstream>
 #include <mutex>
 #include <string>
-#include <unistd.h>    // usleep
+#include <unistd.h>    
 #include <pthread.h>
 
 #include "buffer_base.hpp"
 #include "buffer_monitor.hpp"
 #include "buffer_semaphore.hpp"
 
-// -------------------- Logging --------------------
 
 struct LogEvent {
     long long timestamp_ns;
-    int thread_index;      // 0..P-1 or 0..C-1 depending on role
-    char role;             // 'P' or 'C'
-    std::string event;     // "P_REQ", "P_DONE", "C_REQ", "C_DONE"
-    long item_id;          // -1 if not applicable
+    int thread_index;      
+    char role;            
+    std::string event;    
+    long item_id;       
 };
 
 std::mutex g_log_mutex;
@@ -61,18 +60,20 @@ void write_log_to_csv(const std::string &filename) {
     std::cout << "Wrote log to " << filename << "\n";
 }
 
-// -------------------- Shared State --------------------
+
 
 std::atomic<long> next_id{0};
+std::atomic<long> total_consumed{0}; 
 
 struct ThreadArgs {
     IBoundedBuffer *buffer;
     std::atomic<bool> *stopFlag;
     int threadIndex;
     bool isProducer;
+    long targetItems;
 };
 
-// simple random sleep helper (0–9 ms)
+
 void random_sleep() {
     static thread_local std::mt19937 rng{std::random_device{}()};
     std::uniform_int_distribution<int> dist(0, 9);
@@ -80,20 +81,21 @@ void random_sleep() {
     usleep(ms * 1000);
 }
 
-// -------------------- Thread Functions --------------------
 
 void *producer_func(void *arg) {
     auto *args = static_cast<ThreadArgs *>(arg);
     while (!args->stopFlag->load()) {
+        if (total_consumed.load() >= args->targetItems) {
+            break;
+        }
+
         long id = next_id.fetch_add(1);
         Item it{id};
 
-        // producer is ready to insert
         log_event(args->threadIndex, 'P', "P_REQ", it.id);
 
         args->buffer->put(it);
 
-        // producer finished inserting
         log_event(args->threadIndex, 'P', "P_DONE", it.id);
 
         random_sleep();
@@ -104,33 +106,54 @@ void *producer_func(void *arg) {
 void *consumer_func(void *arg) {
     auto *args = static_cast<ThreadArgs *>(arg);
     while (!args->stopFlag->load()) {
-        // consumer wants an item
+        long current = total_consumed.load();
+        if (current >= args->targetItems) {
+            break;
+        }
+
         log_event(args->threadIndex, 'C', "C_REQ", -1);
 
         Item it = args->buffer->get();
 
-        // consumer got an item
         log_event(args->threadIndex, 'C', "C_DONE", it.id);
+
+        long newTotal = total_consumed.fetch_add(1) + 1;
+
+        if (newTotal >= args->targetItems) {
+            args->stopFlag->store(true);
+        }
 
         random_sleep();
     }
     return nullptr;
 }
 
-// -------------------- main --------------------
-
 int main(int argc, char *argv[]) {
-    const int P = 4;
-    const int C = 4;
-    const std::size_t N = 10;
 
-    // mode selection: default monitor, or "monitor"/"semaphore" from argv[1]
     std::string mode = "monitor";
+    int P = 2;
+    int C = 2;
+    long targetItems = 50;
+    const std::size_t N = 10; 
+
     if (argc >= 2) {
-        mode = argv[1];  // e.g., ./pc monitor  or  ./pc semaphore
+        mode = argv[1];
+    }
+    if (argc >= 3) {
+        P = std::stoi(argv[2]);
+    }
+    if (argc >= 4) {
+        C = std::stoi(argv[3]);
+    }
+    if (argc >= 5) {
+        targetItems = std::stol(argv[4]);
     }
 
-    std::cout << "Mode: " << mode << "\n";
+    std::cout << "Mode: " << mode
+              << " | P=" << P
+              << " | C=" << C
+              << " | targetItems=" << targetItems
+              << "\n";
 
     IBoundedBuffer *buffer = nullptr;
 
@@ -144,6 +167,8 @@ int main(int argc, char *argv[]) {
     }
 
     init_logging();
+    next_id.store(0);
+    total_consumed.store(0);
 
     std::atomic<bool> stop{false};
 
@@ -151,36 +176,42 @@ int main(int argc, char *argv[]) {
     std::vector<pthread_t> consumers(C);
     std::vector<ThreadArgs> pargs(P), cargs(C);
 
-    // create producers
     for (int i = 0; i < P; ++i) {
         pargs[i].buffer = buffer;
         pargs[i].stopFlag = &stop;
         pargs[i].threadIndex = i;
         pargs[i].isProducer = true;
+        pargs[i].targetItems = targetItems;
         pthread_create(&producers[i], nullptr, producer_func, &pargs[i]);
     }
 
-    // create consumers
     for (int i = 0; i < C; ++i) {
         cargs[i].buffer = buffer;
         cargs[i].stopFlag = &stop;
         cargs[i].threadIndex = i;
         cargs[i].isProducer = false;
+        cargs[i].targetItems = targetItems;
         pthread_create(&consumers[i], nullptr, consumer_func, &cargs[i]);
     }
 
-    // run experiment for 5 seconds
-    std::this_thread::sleep_for(std::chrono::seconds(5));
+    while (total_consumed.load() < targetItems) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
     stop.store(true);
 
-    // (for now, don't join to avoid threads stuck waiting on cond vars)
-    // Later you can add proper wakeups + joins for a clean shutdown.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-    // write log to CSV (include mode in filename)
-    std::string filename = "events_" + mode + ".csv";
+
+    std::string filename = "events_" + mode +
+                           "_P" + std::to_string(P) +
+                           "_C" + std::to_string(C) +
+                           "_N" + std::to_string(targetItems) +
+                           ".csv";
     write_log_to_csv(filename);
 
-    std::cout << "Done.\n";
+    std::cout << "Done. Total consumed = " << total_consumed.load() << "\n";
+
     delete buffer;
     return 0;
 }
